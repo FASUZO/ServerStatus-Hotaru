@@ -33,20 +33,53 @@ def get_memory():
     return int(mem.total / 1024.0), int(mem.used / 1024.0), int(swap.total / 1024.0), int(swap.used / 1024.0)
 
 
-def get_hdd():
-    valid_fs = ['ext4', 'ext3', 'ext2', 'reiserfs', 'jfs', 'btrfs', 'fuseblk', 'zfs', 'simfs', 'ntfs', 'fat32', 'exfat',
-                'xfs']
+def _disk_total(partitions):
+    """按设备去重后累加容量，返回 (总容量MB, 已用MB)。"""
     disks = dict()
+    for disk in partitions:
+        if disk.device not in disks:
+            disks[disk.device] = disk.mountpoint
     size = 0
     used = 0
-    for disk in psutil.disk_partitions():
-        if disk.device not in disks and disk.fstype.lower() in valid_fs:
-            disks[disk.device] = disk.mountpoint
-    for disk in disks.values():
-        usage = psutil.disk_usage(disk)
+    for mountpoint in disks.values():
+        try:
+            usage = psutil.disk_usage(mountpoint)
+        except Exception:
+            # 挂载点不可访问（权限不足 / 已卸载）时跳过，不影响其它磁盘
+            continue
         size += usage.total
         used += usage.used
     return int(size / 1024.0 / 1024.0), int(used / 1024.0 / 1024.0)
+
+
+def get_hdd():
+    # 修复：原实现只统计白名单内的文件系统且没有任何兜底，导致：
+    #   1) 容器（overlayfs）或 virtiofs 等新型文件系统的机器上统计结果恒为 0；
+    #   2) 任一挂载点不可读时 disk_usage() 抛异常，客户端会整体重连。
+    # 现增加两级回退，并跳过不可读的挂载点。
+    valid_fs = ['ext4', 'ext3', 'ext2', 'reiserfs', 'jfs', 'btrfs', 'fuseblk', 'zfs',
+                'simfs', 'ntfs', 'fat32', 'exfat', 'xfs']
+    # 回退统计时需要排除的内存/虚拟文件系统
+    skip_fs = ['tmpfs', 'devtmpfs', 'squashfs', 'proc', 'sysfs', 'cgroup', 'cgroup2',
+               'ramfs', 'autofs', 'mqueue', 'debugfs', 'tracefs', 'securityfs',
+               'pstore', 'bpf', 'configfs', 'fusectl', 'hugetlbfs', 'binfmt_misc']
+    try:
+        partitions = psutil.disk_partitions()
+    except Exception:
+        partitions = []
+    selected = [d for d in partitions if d.fstype.lower() in valid_fs]
+    if selected:
+        return _disk_total(selected)
+
+    try:
+        # all=True 会包含 nodev 文件系统（例如容器里的 overlay 根分区）
+        partitions = psutil.disk_partitions(all=True)
+    except Exception:
+        return 0, 0
+    selected = [d for d in partitions if d.fstype and d.fstype.lower() not in skip_fs]
+    if selected:
+        return _disk_total(selected)
+    return 0, 0
 
 
 def get_load():

@@ -35,15 +35,17 @@ CConfig::CConfig()
 	// Initialize to default values
 	m_Verbose = false; // -v, --verbose
 	str_copy(m_aConfigFile, "config.json", sizeof(m_aConfigFile)); // -c, --config
-	str_copy(m_aWebDir, "../web/", sizeof(m_aJSONFile)); // -d, --web-dir
+	str_copy(m_aWebDir, "../web/", sizeof(m_aWebDir)); // -d, --web-dir
 	str_copy(m_aTemplateFile, "template.html", sizeof(m_aTemplateFile));
 	str_copy(m_aJSONFile, "json/stats.json", sizeof(m_aJSONFile));
 	str_copy(m_aBindAddr, "", sizeof(m_aBindAddr)); // -b, --bind
 	m_Port = 35601; // -p, --port
+	m_Timeout = 15; // -t, --timeout（认证后无数据多少秒断开，须大于客户端上报间隔）
 }
 
 CMain::CMain(CConfig Config) : m_Config(Config)
 {
+	m_ClientLock = lock_create();
 	mem_zero(m_aClients, sizeof(m_aClients));
 	for(int i = 0; i < NET_MAX_CLIENTS; i++)
 		m_aClients[i].m_ClientNetID = -1;
@@ -212,10 +214,13 @@ void CMain::JSONUpdateThread(void *pUser)
 	{
 		char aFileBuf[2048*NET_MAX_CLIENTS];
 		char *pBuf = aFileBuf;
+		char aHeader[] = "{\n\"servers\": [\n";
 
-		str_format(pBuf, sizeof(aFileBuf), "{\n\"servers\": [\n");
+		str_format(pBuf, sizeof(aFileBuf), "%s", aHeader);
 		pBuf += strlen(pBuf);
 
+		// 读取客户端数组期间加锁，与主线程的写入（ReadConfig / 统计更新）互斥
+		lock_wait(*m_pJSONUpdateThreadData->pLock);
 		for(int i = 0; i < NET_MAX_CLIENTS; i++)
 		{
 			if(!pClients[i].m_Active || pClients[i].m_Disabled)
@@ -224,15 +229,11 @@ void CMain::JSONUpdateThread(void *pUser)
 			if(pClients[i].m_Connected)
 			{
 				// Uptime
+				// 原代码 if(Days > 1) 与 else 两个分支内容完全相同（复制粘贴遗留），此处合并
 				char aUptime[16];
 				int Days = pClients[i].m_Stats.m_Uptime/60.0/60.0/24.0;
 				if(Days > 0)
-				{
-					if(Days > 1)
-						str_format(aUptime, sizeof(aUptime), "%d 天", Days);
-					else
-						str_format(aUptime, sizeof(aUptime), "%d 天", Days);
-				}
+					str_format(aUptime, sizeof(aUptime), "%d 天", Days);
 				else
 					str_format(aUptime, sizeof(aUptime), "%02d:%02d:%02d", (int)(pClients[i].m_Stats.m_Uptime/60.0/60.0), (int)((pClients[i].m_Stats.m_Uptime/60)%60), (int)((pClients[i].m_Stats.m_Uptime)%60));
 
@@ -247,14 +248,21 @@ void CMain::JSONUpdateThread(void *pUser)
 				pBuf += strlen(pBuf);
 			}
 		}
+		// 修复：仅当确实写入过节点时才回退 2 字节，抹掉最后一个条目多余的 ",\n"。
+		// 原代码无条件执行 pBuf - 2，当没有任何“启用且未禁用”的节点时（例如唯一
+		// 节点被禁用），会把 JSON 数组的 '[' 一并覆盖掉，生成非法 JSON。
+		if(pBuf > aFileBuf + (int)strlen(aHeader))
+			pBuf -= 2;
+
 		if(!m_pJSONUpdateThreadData->m_ReloadRequired)
-			str_format(pBuf - 2, sizeof(aFileBuf) - (pBuf - aFileBuf), "\n],\n\"updated\": \"%lld\"\n}", (long long)time(/*ago*/0));
+			str_format(pBuf, (int)(sizeof(aFileBuf) - (pBuf - aFileBuf)), "\n],\n\"updated\": \"%lld\"\n}", (long long)time(/*ago*/0));
 		else
 		{
-			str_format(pBuf - 2, sizeof(aFileBuf) - (pBuf - aFileBuf), "\n],\n\"updated\": \"%lld\",\n\"reload\": true\n}", (long long)time(/*ago*/0));
+			str_format(pBuf, (int)(sizeof(aFileBuf) - (pBuf - aFileBuf)), "\n],\n\"updated\": \"%lld\",\n\"reload\": true\n}", (long long)time(/*ago*/0));
 			m_pJSONUpdateThreadData->m_ReloadRequired--;
 		}
 		pBuf += strlen(pBuf);
+		lock_release(*m_pJSONUpdateThreadData->pLock);
 
 		char aJSONFileTmp[1024];
 		str_format(aJSONFileTmp, sizeof(aJSONFileTmp), "%s~", pConfig->m_aJSONFile);
@@ -300,6 +308,10 @@ int CMain::ReadConfig()
 		mem_free(pFileData);
 		return 1;
 	}
+
+	// 以下会修改 m_aClients，必须与 JSON 更新线程互斥。
+	// 注意：Drop() 会同步回调 OnDelClient，该回调内部不再加锁（避免自死锁）。
+	lock_wait(m_ClientLock);
 
 	// reset clients
 	for(int i = 0; i < NET_MAX_CLIENTS; i++)
@@ -347,12 +359,15 @@ int CMain::ReadConfig()
 		}
 	}
 
+	// tell clients to reload the page
+	// 需在持锁期间写入，与 JSON 线程中的递减互斥
+	m_JSONUpdateThreadData.m_ReloadRequired = 2;
+
+	lock_release(m_ClientLock);
+
 	// clean up
 	json_value_free(pJsonData);
 	mem_free(pFileData);
-
-	// tell clients to reload the page
-	m_JSONUpdateThreadData.m_ReloadRequired = 2;
 
 	return 0;
 }
@@ -369,6 +384,7 @@ int CMain::Run()
 	m_JSONUpdateThreadData.m_ReloadRequired = 2;
 	m_JSONUpdateThreadData.pClients = m_aClients;
 	m_JSONUpdateThreadData.pConfig = &m_Config;
+	m_JSONUpdateThreadData.pLock = &m_ClientLock;
 	void *LoadThread = thread_create(JSONUpdateThread, &m_JSONUpdateThreadData);
 	//thread_detach(LoadThread);
 
@@ -382,7 +398,11 @@ int CMain::Run()
 			gs_ReloadConfig = 0;
 		}
 
+		// Update() 会通过回调（OnNewClient / OnDelClient / HandleMessage）写入
+		// m_aClients，因此需与 JSON 更新线程互斥；ReadConfig() 在锁外自行加锁。
+		lock_wait(m_ClientLock);
 		m_Server.Update();
+		lock_release(m_ClientLock);
 
 		// wait for incomming data
 		net_socket_read_wait(*m_Server.Network()->Socket(), 10);
@@ -421,6 +441,7 @@ int main(int argc, const char *argv[])
 		OPT_STRING('d', "web-dir", &pWebDir, "Location of the web directory", 0),
 		OPT_STRING('b', "bind", &pBindAddr, "Bind to address", 0),
 		OPT_INTEGER('p', "port", &Config.m_Port, "Listen on port", 0),
+		OPT_INTEGER('t', "timeout", &Config.m_Timeout, "Drop authed clients after N seconds without data (default 15)", 0),
 		OPT_END(),
 	};
 	struct argparse Argparse;
@@ -434,7 +455,14 @@ int main(int argc, const char *argv[])
 	if(pBindAddr)
 		str_copy(Config.m_aBindAddr, pBindAddr, sizeof(Config.m_aBindAddr));
 
-	if(Config.m_aWebDir[strlen(Config.m_aWebDir)-1] != '/')
+	// --timeout 下限保护：必须明显大于客户端上报间隔，否则客户端会被反复断开。
+	// （手机常驻时若把客户端间隔设为 60 秒，这里应相应设为 120 以上）
+	if(Config.m_Timeout < 5)
+		Config.m_Timeout = 5;
+
+	// 修复：原为 strlen(...)-1，若 -d 传入空字符串则下标下溢（越界读）
+	int WebDirLen = (int)str_length(Config.m_aWebDir);
+	if(WebDirLen == 0 || Config.m_aWebDir[WebDirLen-1] != '/')
 		str_append(Config.m_aWebDir, "/", sizeof(Config.m_aWebDir));
 	if(!fs_is_dir(Config.m_aWebDir))
 	{

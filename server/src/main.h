@@ -14,6 +14,7 @@ public:
 	char m_aJSONFile[1024];
 	char m_aBindAddr[256];
 	int m_Port;
+	int m_Timeout;
 
 	CConfig();
 };
@@ -22,6 +23,12 @@ class CMain
 {
 	CConfig m_Config;
 	CServer m_Server;
+
+	// 保护 m_aClients：主线程（ReadConfig / HandleMessage / OnNewClient /
+	// OnDelClient）负责写入，JSON 更新线程负责读取。
+	// 注意：pthread 互斥锁不可重入，因此只在最外层加锁；由主线程同步调用的
+	// 回调（OnNewClient / OnDelClient / HandleMessage）内部不得再次加锁。
+	LOCK m_ClientLock;
 
 	struct CClient
 	{
@@ -68,6 +75,7 @@ class CMain
 	{
 		CClient *pClients;
 		CConfig *pConfig;
+		LOCK *pLock;
 		volatile short m_ReloadRequired;
 	} m_JSONUpdateThreadData;
 

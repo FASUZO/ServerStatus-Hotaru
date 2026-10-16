@@ -100,12 +100,17 @@ void CServer::Update()
 			char aPassword[128] = {0};
 			const char *pTmp;
 
+			// 注意：这里必须用 >= 判断。原代码用 > ，当 ':' 恰好在第 128 个字符时
+			// 会通过校验，随后 str_copy(aUsername, aBuf, 129) 向 128 字节的
+			// aUsername 写入 129 字节，造成 1 字节栈越界写。
 			if(!(pTmp = str_find(aBuf, ":"))
-				|| (unsigned)(pTmp - aBuf) > sizeof(aUsername) || (unsigned)(str_length(pTmp) - 1) > sizeof(aPassword))
+				|| (unsigned)(pTmp - aBuf) >= sizeof(aUsername) || (unsigned)(str_length(pTmp) - 1) >= sizeof(aPassword))
 			{
 				m_Network.NetBan()->BanAddr(m_Network.ClientAddr(ClientID), 60, "You're an idiot, go away.");
 				m_Network.Drop(ClientID, "Fuck off.");
-				return;
+				// 修复：原为 return; 会直接结束本轮 Update()，导致同一个 tick 内
+				// 其它客户端的待处理报文被丢弃、超时清理也被跳过；改为 continue。
+				continue;
 			}
 
 			str_copy(aUsername, aBuf, pTmp - aBuf + 1);
@@ -114,7 +119,8 @@ void CServer::Update()
 			{
 				m_Network.NetBan()->BanAddr(m_Network.ClientAddr(ClientID), 60, "You're an idiot, go away.");
 				m_Network.Drop(ClientID, "Username and password must not be blank.");
-				return;
+				// 同上：改为 continue，避免中断整轮事件处理
+				continue;
 			}
 
 			for(int i = 0; i < NET_MAX_CLIENTS; i++)
@@ -164,6 +170,13 @@ void CServer::Update()
 		}
 	}
 
+	// 认证后「无数据」超时：可由 --timeout=<秒> 配置（默认 15）。
+	// 手机常驻场景常把客户端上报间隔拉长到 30~60 秒以省电，此时必须同步调大本值，
+	// 否则节点会被服务端反复断开、面板上闪烁。
+	int Timeout = Main()->Config()->m_Timeout;
+	if(Timeout <= 0)
+		Timeout = 15;
+
 	for(int i = 0; i < NET_MAX_CLIENTS; ++i)
 	{
 		if(m_aClients[i].m_State == CClient::STATE_CONNECTED &&
@@ -173,7 +186,7 @@ void CServer::Update()
 			m_Network.Drop(i, "Authentication timeout.");
 		}
 		else if(m_aClients[i].m_State == CClient::STATE_AUTHED &&
-			time_get() > m_aClients[i].m_LastReceived + 15 * time_freq())
+			time_get() > m_aClients[i].m_LastReceived + (int64)Timeout * time_freq())
 			m_Network.Drop(i, "Timeout.");
 	}
 }

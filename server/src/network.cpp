@@ -64,7 +64,11 @@ int CNetwork::AcceptClient(NETSOCKET Socket, const NETADDR *pAddr)
 			FreeSlot = i;
 		if(m_aSlots[i].m_Connection.State() != NET_CONNSTATE_OFFLINE)
 		{
-			if(net_addr_comp(pAddr, m_aSlots[i].m_Connection.PeerAddress()) == 0)
+			// 修复：net_addr_comp() 比较的是整个 NETADDR（包含源端口），而两条 TCP
+			// 连接的源端口必然不同，导致“同 IP 只允许一个连接”的检查实际永不成立。
+			// 这里改用 NetComp()（定义见 netban.h），只比较 IP 地址部分。
+			// 注意：启用后同一出口 IP 下的多个节点将无法同时接入本服务端。
+			if(NetComp(pAddr, m_aSlots[i].m_Connection.PeerAddress()) == 0)
 			{
 				str_copy(aError, "Only one client per IP allowed.", sizeof(aError));
 				break;

@@ -15,6 +15,16 @@ PORT = 35601
 USER = "USER"
 PASSWORD = "USER_PASSWORD"
 INTERVAL = 1  # 更新间隔，单位：秒
+# 允许用环境变量覆盖上报间隔（手机常驻建议 30~60 秒：间隔越长，射频/CPU 唤醒越少、越省电）。
+# 注意：服务端有「无数据超时」机制（默认 15 秒无数据即断开并清零统计），
+#      间隔必须明显小于该超时，否则节点会被反复断开、面板上闪烁。
+#      服务端可用 --timeout=<秒> 调大该超时（见 README）。
+_iv = os.environ.get('SS_INTERVAL')
+if _iv:
+    try:
+        INTERVAL = max(1, int(_iv))
+    except ValueError:
+        pass
 
 
 def check_interface(net_name):
@@ -24,41 +34,106 @@ def check_interface(net_name):
 
 
 def get_uptime():
-    with open('/proc/uptime', 'r') as f:
-        uptime = f.readline().split('.')
-    return int(uptime[0])
+    try:
+        with open('/proc/uptime', 'r') as f:
+            uptime = f.readline().split('.')
+        return int(uptime[0])
+    except Exception:
+        # 受限环境（如 Android）可能读不到 /proc/uptime；返回 0 而不是让客户端整体崩掉
+        return 0
 
 
 def get_memory():
     re_parser = re.compile(r'(\S*):\s*(\d*)\s*kB')
     result = dict()
-    for line in open('/proc/meminfo'):
-        match = re_parser.match(line)
-        if match:
-            result[match.group(1)] = int(match.group(2))
+    try:
+        with open('/proc/meminfo') as f:
+            for line in f:
+                match = re_parser.match(line)
+                if match:
+                    result[match.group(1)] = int(match.group(2))
 
-    mem_total = float(result['MemTotal'])
-    mem_free = float(result['MemFree'])
-    buffers = float(result['Buffers'])
-    cached = float(result['Cached'])
-    mem_used = mem_total - (mem_free + buffers + cached)
-    swap_total = float(result['SwapTotal'])
-    swap_free = float(result['SwapFree'])
-    return int(mem_total), int(mem_used), int(swap_total), int(swap_free)
+        mem_total = float(result['MemTotal'])
+        mem_free = float(result['MemFree'])
+        buffers = float(result['Buffers'])
+        cached = float(result['Cached'])
+        mem_used = mem_total - (mem_free + buffers + cached)
+        swap_total = float(result['SwapTotal'])
+        swap_free = float(result['SwapFree'])
+        return int(mem_total), int(mem_used), int(swap_total), int(swap_free)
+    except Exception:
+        return 0, 0, 0, 0
+
+
+def _df_output(args):
+    """执行 df 并返回标准输出；失败（例如无任何匹配的文件系统）时返回 None，不抛异常。"""
+    try:
+        p = subprocess.check_output(args, stderr=subprocess.PIPE)
+    except Exception:
+        return None
+    if not isinstance(p, str):
+        p = p.decode('utf-8', 'replace')
+    return p
+
+
+def _parse_df_total(output):
+    """从 df -Tlm --total 的输出中解析出 (总容量MB, 已用MB)；解析失败返回 None。"""
+    if not output:
+        return None
+    total = None
+    for line in output.splitlines():
+        parts = line.split()
+        # df 的汇总行首列固定为 total
+        if parts and parts[0] == 'total':
+            total = parts
+    if total is None:
+        # 兼容没有汇总行的情况：至少需要一行数据（排除表头）
+        lines = [line for line in output.splitlines() if line.strip()]
+        if len(lines) < 2:
+            return None
+        total = lines[-1].split()
+    if len(total) < 4:
+        return None
+    try:
+        return int(total[2]), int(total[3])
+    except ValueError:
+        return None
 
 
 def get_hdd():
-    p = subprocess.check_output(
-        ['df', '-Tlm', '--total', '-t', 'ext4', '-t', 'ext3', '-t', 'ext2', '-t', 'reiserfs', '-t', 'jfs', '-t', 'ntfs',
-         '-t', 'fat32', '-t', 'btrfs', '-t', 'fuseblk', '-t', 'zfs', '-t', 'simfs', '-t', 'xfs']).decode('utf-8')
-    total = p.splitlines()[-1]
-    used = total.split()[3]
-    size = total.split()[2]
-    return int(size), int(used)
+    # 修复：原实现直接取 df 输出的最后一行。当根分区文件系统不在硬编码白名单内
+    # （容器里的 overlayfs、virtiofs 等）时，GNU df 会打印 "no file systems processed"
+    # 到 stderr、stdout 为空且返回非 0 退出码，check_output 直接抛异常，
+    # 客户端便会陷入「连接 -> 异常 -> 重连」死循环，面板上该节点永远离线。
+    # 现改为三级回退，并保证任何情况下都返回数值。
+    valid_fs = ['ext4', 'ext3', 'ext2', 'reiserfs', 'jfs', 'ntfs', 'fat32', 'btrfs',
+                'fuseblk', 'zfs', 'simfs', 'xfs']
+    valid_args = ['df', '-Tlm', '--total']
+    for fs in valid_fs:
+        valid_args += ['-t', fs]
+
+    exclude_fs = ['tmpfs', 'devtmpfs', 'squashfs', 'proc', 'sysfs', 'cgroup', 'cgroup2',
+                  'ramfs', 'autofs', 'mqueue', 'debugfs', 'tracefs', 'securityfs',
+                  'pstore', 'bpf', 'configfs', 'fusectl', 'hugetlbfs', 'binfmt_misc']
+    exclude_args = ['df', '-Tlm', '--total']
+    for fs in exclude_fs:
+        exclude_args += ['-x', fs]
+
+    candidates = [valid_args, exclude_args, ['df', '-Tlm', '--total']]
+    for args in candidates:
+        result = _parse_df_total(_df_output(args))
+        if result and result[0] > 0:
+            return result
+    # 全部取不到时返回 0，避免因异常反复重连（其余指标仍可正常上报）
+    return 0, 0
 
 
 def get_load():
-    return round(os.getloadavg()[0], 1)
+    try:
+        return round(os.getloadavg()[0], 1)
+    except Exception:
+        # Android/bionic 等环境可能不提供 getloadavg
+        return 0.0
 
 
 def get_cpu_time():
@@ -69,20 +144,31 @@ def get_cpu_time():
 
 
 def get_cpu():
-    old_total, old_idle = get_cpu_time()
-    time.sleep(INTERVAL)
-    total, idle = get_cpu_time()
-    return round(100 - float(idle - old_idle) / (total - old_total) * 100.00, 1)
+    try:
+        old_total, old_idle = get_cpu_time()
+        time.sleep(INTERVAL)
+        total, idle = get_cpu_time()
+        # 两次采样落在同一个 jiffy 内时 total-old_total 会是 0（原实现会 ZeroDivisionError）
+        if total - old_total <= 0:
+            return 0.0
+        return round(100 - float(idle - old_idle) / (total - old_total) * 100.00, 1)
+    except Exception:
+        time.sleep(INTERVAL)
+        return 0.0
 
 
 def get_traffic_vnstat():
-    vnstat = os.popen('vnstat --oneline b').readline()
-    if "Not enough data available yet" in vnstat:
+    try:
+        vnstat = os.popen('vnstat --oneline b').readline()
+        if "Not enough data available yet" in vnstat:
+            return 0, 0
+        v_data = vnstat.split(';')
+        net_in = int(v_data[8])
+        net_out = int(v_data[9])
+        return net_in, net_out
+    except Exception:
+        # vnstat 未安装 / 输出格式不符 / 数据不足
         return 0, 0
-    v_data = vnstat.split(';')
-    net_in = int(v_data[8])
-    net_out = int(v_data[9])
-    return net_in, net_out
 
 
 class Network:
@@ -96,21 +182,30 @@ class Network:
         net_out = 0
         re_parser = re.compile(r'([^\s]+):[\s]*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+('
                                r'\d+)\s+(\d+)\s+(\d+)')
-        with open('/proc/net/dev') as f:
-            for line in f.readlines():
-                net_info = re_parser.findall(line)
-                if net_info:
-                    if check_interface(net_info[0][0]):
-                        net_in += int(net_info[0][1])
-                        net_out += int(net_info[0][9])
+        try:
+            with open('/proc/net/dev') as f:
+                for line in f.readlines():
+                    net_info = re_parser.findall(line)
+                    if net_info:
+                        if check_interface(net_info[0][0]):
+                            net_in += int(net_info[0][1])
+                            net_out += int(net_info[0][9])
+        except Exception:
+            # /proc/net/dev 不可用（部分 Android 版本对其做了限制）时不追加样本，
+            # 保留上一次读数，避免把"读不到"误算成一次流量归零。
+            return False
         self.rx.append(net_in)
         self.tx.append(net_out)
+        return True
 
     def get_speed(self):
-        self._get_traffic()
+        if not self._get_traffic():
+            return 0, 0
         avg_rx = 0
         avg_tx = 0
         queue_len = len(self.rx)
+        if queue_len < 2:
+            return 0, 0
         for x in range(queue_len - 1):
             avg_rx += self.rx[x + 1] - self.rx[x]
             avg_tx += self.tx[x + 1] - self.tx[x]
@@ -120,6 +215,8 @@ class Network:
 
     def get_traffic(self):
         queue_len = len(self.rx)
+        if queue_len == 0:
+            return 0, 0
         return self.rx[queue_len - 1], self.tx[queue_len - 1]
 
 

@@ -28,9 +28,30 @@ jq_file="${file}/jq"
 [[ ! -e ${jq_file} ]] && jq_file="/usr/bin/jq"
 region_json="${file}/region.json"
 
-github_prefix="https://raw.githubusercontent.com/CokeMine/ServerStatus-Hotaru/master"
-coding_prefix="https://cokemine.coding.net/p/hotarunet/d/ServerStatus-Hotaru/git/raw/master"
-link_prefix=${github_prefix}
+# ------------------------- 仓库与下载源配置 -------------------------
+# 重要：安装/更新时会从下面这些地址下载 客户端脚本、服务脚本、前端包、jq 等文件。
+#      为了让本仓库（含已修复的文件）真正生效，repo_owner 必须指向你实际维护的仓库。
+#      修改仓库后请先 push，否则安装到的仍是远端旧文件。
+repo_owner="FASUZO"
+repo_name="ServerStatus-Hotaru"
+repo_branch="master"
+
+# GitHub 官方源
+github_raw="https://raw.githubusercontent.com/${repo_owner}/${repo_name}/${repo_branch}"
+
+# GitHub 加速镜像前缀（留空则禁用）。用法：<前缀>/https://github.com/xxx
+# 说明：原脚本使用的 FastGit（hub.fastgit.org / raw.fastgit.org）已于 2022 年正式停止服务，
+#      这里改用通用加速前缀，并在运行时探测可用性，不可用时自动回退 GitHub 官方源。
+#      如需改用其它镜像（例如 Coding.net 上游镜像
+#      https://cokemine.coding.net/p/hotarunet/d/ServerStatus-Hotaru/git/raw/master ，
+#      注意它只同步上游仓库、不含本仓库的修复），替换下面的取值即可。
+github_accelerator="https://gh-proxy.com"
+
+# 以下变量由 Set_download_source / Set_Mirror 在运行时按镜像选择结果赋值
+link_prefix="${github_raw}"                  # 实际生效的仓库文件前缀
+github_link="https://github.com"             # releases / 归档下载前缀
+raw_link="https://raw.githubusercontent.com" # raw 文件下载前缀
+_download_source_resolved=""
 
 Green_font_prefix="\033[32m" && Red_font_prefix="\033[31m" && Red_background_prefix="\033[41;37m" && Font_color_suffix="\033[0m"
 Info="${Green_font_prefix}[信息]${Font_color_suffix}"
@@ -73,7 +94,9 @@ check_pid_client() {
 check_region() {
   # 如果找不到 region 文件, 默认不检测
   [[ ! -e "${region_json}" ]] && return 0
-  if ${jq_file} "[.countries | has(\"${region_s}}\")]" "${region_json}" | grep -q 'true' >/dev/null 2>&1; then
+  # 修复：原为 has(\"${region_s}}\") 多了一个右花括号，导致 jq 判断恒为 false
+  [[ -z "${region_s}" ]] && return 1
+  if [[ -x ${jq_file} ]] && ${jq_file} "[.countries | has(\"${region_s}\")]" "${region_json}" | grep -q 'true' >/dev/null 2>&1; then
     return 0
   elif grep -qw "${region_s}" "${region_json}"; then
     region_s=$(grep -w "${region_s}" "${region_json}" | sed "s/[[:space:]]//g")
@@ -82,31 +105,67 @@ check_region() {
   fi
   return 1
 }
+# 探测 URL 是否可达（HEAD 请求，超时 10 秒）
+check_url() {
+  wget --spider -q -T 10 --no-check-certificate "$1" >/dev/null 2>&1
+}
+# 解析本次实际使用的下载前缀：
+#   mirror_num=1 -> GitHub 官方源
+#   mirror_num=2 -> GitHub 加速镜像；探测不可达时自动回退官方源
+Set_download_source() {
+  [[ -n ${_download_source_resolved} ]] && return 0
+  _download_source_resolved="1"
+  github_link="https://github.com"
+  raw_link="https://raw.githubusercontent.com"
+  link_prefix="${github_raw}"
+  if [[ ${mirror_num} == 2 ]]; then
+    if [[ -n ${github_accelerator} ]] &&
+      check_url "${github_accelerator}/https://raw.githubusercontent.com/${repo_owner}/${repo_name}/${repo_branch}/status.sh"; then
+      github_link="${github_accelerator}/https://github.com"
+      raw_link="${github_accelerator}/https://raw.githubusercontent.com"
+      link_prefix="${raw_link}/${repo_owner}/${repo_name}/${repo_branch}"
+      echo -e "${Info} 已启用 GitHub 加速镜像: ${github_accelerator}"
+    else
+      echo -e "${Tip} GitHub 加速镜像不可达，已自动回退为 GitHub 官方源（下载可能较慢）"
+    fi
+  fi
+}
 Download_Server_Status_server() {
   cd "/tmp" || exit 1
-  [[ ${mirror_num} == 2 ]] && bundle_link="https://cokemine.coding.net/p/hotarunet/d/ServerStatus-Hotaru/git/archive/master/?download=true" || bundle_link="https://github.com/CokeMine/ServerStatus-Hotaru/archive/master.zip"
-  [[ ${mirror_num} == 2 ]] && github_link="https://hub.fastgit.org" || github_link="https://github.com"
+  Set_download_source
+  bundle_link="${github_link}/${repo_owner}/${repo_name}/archive/${repo_branch}.zip"
   wget -N --no-check-certificate "${bundle_link}" -O "master.zip"
   [[ ! -e "master.zip" ]] && echo -e "${Error} ServerStatus 服务端下载失败 !" && exit 1
   unzip master.zip
   rm -rf master.zip
-  [[ -d "/tmp/cokemine-hotarunet-ServerStatus-Hotaru-master" ]] && mv "/tmp/cokemine-hotarunet-ServerStatus-Hotaru-master" "/tmp/ServerStatus-Hotaru-master"
-  [[ ! -d "/tmp/ServerStatus-Hotaru-master" ]] && echo -e "${Error} ServerStatus 服务端解压失败 !" && exit 1
-  cd "/tmp/ServerStatus-Hotaru-master/server" || exit 1
+  # 兼容手工放入 Coding.net 归档（其顶层目录名不同）的情况
+  [[ -d "/tmp/cokemine-hotarunet-ServerStatus-Hotaru-master" ]] && mv "/tmp/cokemine-hotarunet-ServerStatus-Hotaru-master" "/tmp/${repo_name}-${repo_branch}"
+  [[ ! -d "/tmp/${repo_name}-${repo_branch}" ]] && echo -e "${Error} ServerStatus 服务端解压失败 !" && exit 1
+  cd "/tmp/${repo_name}-${repo_branch}/server" || exit 1
   make
-  [[ ! -e "sergate" ]] && echo -e "${Error} ServerStatus 服务端编译失败 !" && cd "${file_1}" && rm -rf "/tmp/ServerStatus-Hotaru-master" && exit 1
+  [[ ! -e "sergate" ]] && echo -e "${Error} ServerStatus 服务端编译失败 !" && cd "${file_1}" && rm -rf "/tmp/${repo_name}-${repo_branch}" && exit 1
   cd "${file_1}" || exit 1
   mkdir -p "${server_file}"
   if [[ -e "${server_file}/sergate" ]]; then
     mv "${server_file}/sergate" "${server_file}/sergate1"
-    mv "/tmp/ServerStatus-Hotaru-master/server/sergate" "${server_file}/sergate"
+    mv "/tmp/${repo_name}-${repo_branch}/server/sergate" "${server_file}/sergate"
   else
-    mv "/tmp/ServerStatus-Hotaru-master/server/sergate" "${server_file}/sergate"
+    mv "/tmp/${repo_name}-${repo_branch}/server/sergate" "${server_file}/sergate"
     wget -N --no-check-certificate "${github_link}/cokemine/hotaru_theme/releases/latest/download/hotaru-theme.zip"
-    unzip hotaru-theme.zip && mv "./hotaru-theme" "${web_file}"
-    rm -rf hotaru-theme.zip
+    if [[ ! -e "hotaru-theme.zip" ]]; then
+      echo -e "${Error} 前端主题包下载失败，请手动部署到 ${web_file} !"
+      exit 1
+    fi
+    unzip -o hotaru-theme.zip
+    # 修复：原为 mv ./hotaru-theme ${web_file}。若 ${web_file} 目录已存在（重装、
+    #      上一次安装中断等），该写法会把主题目录整个移进 web 内部多出一层，
+    #      导致站点根目录没有 index.html。改为把主题内容复制进 web 目录。
+    mkdir -p "${web_file}"
+    cp -a ./hotaru-theme/. "${web_file}/"
+    rm -rf ./hotaru-theme hotaru-theme.zip
+    [[ ! -e "${web_file}/index.html" ]] && echo -e "${Tip} 未在 ${web_file} 找到 index.html，请确认前端文件是否部署正确 !"
   fi
-  rm -rf "/tmp/ServerStatus-Hotaru-master"
+  rm -rf "/tmp/${repo_name}-${repo_branch}"
   if [[ ! -e "${server_file}/sergate" ]]; then
     echo -e "${Error} ServerStatus 服务端移动重命名失败 !"
     [[ -e "${server_file}/sergate1" ]] && mv "${server_file}/sergate1" "${server_file}/sergate"
@@ -345,6 +404,8 @@ Set_region() {
   [[ -z "$region_s" ]] && region_s="HK"
   while ! check_region; do
     read -erp "你输入的节点地区不合法，请重新输入：" region_s
+    # 防止空输入导致 while 死循环
+    [[ -z "$region_s" ]] && region_s="HK"
   done
   echo && echo "	================================================"
   echo -e "	节点地区[region]: ${Red_background_prefix} ${region_s} ${Font_color_suffix}"
@@ -681,7 +742,9 @@ Install_vnStat() {
 }
 Modify_config_client_traffic() {
   [ -z ${isVnstat} ] && [[ ${client_vnstat_s} == "false" ]] && return
-  if [[ ${isVnstat="y"} == [Yy] ]]; then
+  # 修复：原为 [[ ${isVnstat="y"} == [Yy] ]]，在判断表达式中给变量赋值（隐式副作用）。
+  #      改用参数默认值展开，语义等价且不再偷偷改变量。
+  if [[ ${isVnstat:-y} == [Yy] ]]; then
     vnstat -v >/dev/null 2>&1 || Install_vnStat
     netName=$(awk '{i++; if( i>2 && ($2 != 0 && $10 != 0) ){print $1}}' /proc/net/dev | sed 's/^lo:$//g' | sed 's/^tun:$//g' | sed '/^$/d' | sed 's/^[\t]*//g' | sed 's/[:]*$//g')
     if [ -z "$netName" ]; then
@@ -696,9 +759,17 @@ Modify_config_client_traffic() {
     while ! [[ $time_N =~ ^[0-9]*$ ]] || ((time_N < 1 || time_N > 28)); do
       read -erp "你输入的日期不合法，请重新输入: " time_N
     done
-    sed -i "s/$(grep -w "MonthRotate" /etc/vnstat.conf)/MonthRotate $time_N/" /etc/vnstat.conf
-    sed -i "s/$(grep -w "Interface" /etc/vnstat.conf)/Interface \"$netName\"/" /etc/vnstat.conf
-    chmod -R 777 /var/lib/vnstat/
+    # 修复：原写法把 grep 结果拼进 sed 表达式，命中多行时 sed 会直接报错；
+    #      改为按行锚定匹配，安全且可重复执行（幂等）。
+    sed -i -E "s|^[[:space:]]*#?[[:space:]]*MonthRotate[[:space:]].*|MonthRotate ${time_N}|" /etc/vnstat.conf
+    sed -i -E "s|^[[:space:]]*#?[[:space:]]*Interface[[:space:]].*|Interface \"${netName}\"|" /etc/vnstat.conf
+    # 修复：原为 chmod -R 777 /var/lib/vnstat/（任意用户可写数据库，存在安全风险）。
+    #      改为：优先把目录交给 vnstat 用户，其次退回 755，两种情况都保证 vnstatd 可写。
+    if id -u vnstat >/dev/null 2>&1; then
+      chown -R vnstat:vnstat /var/lib/vnstat 2>/dev/null
+    fi
+    chmod 755 /var/lib/vnstat/ 2>/dev/null
+    [[ -d /var/lib/vnstat ]] && chmod 644 /var/lib/vnstat/* 2>/dev/null
     systemctl restart vnstat
     if ! grep -q "NET_IN, NET_OUT = get_traffic_vnstat()" ${client_file}/status-client.py; then
       sed -i 's/\t/    /g' ${client_file}/status-client.py
@@ -717,13 +788,7 @@ Modify_config_client() {
   Modify_config_client_traffic
 }
 Install_jq() {
-  [[ ${mirror_num} == 2 ]] && {
-    github_link="https://hub.fastgit.org"
-    raw_link="https://raw.fastgit.org"
-  } || {
-    github_link="https://github.com"
-    raw_link="https://raw.githubusercontent.com"
-  }
+  Set_download_source
   if [[ ! -e ${jq_file} ]]; then
     if [[ ${bit} == "x86_64" ]]; then
       jq_file="${file}/jq"
@@ -1199,12 +1264,14 @@ menu_server() {
   esac
 }
 Set_Mirror() {
-  echo -e "${Info} 请输入要选择的下载源，默认使用GitHub，中国大陆建议选择Coding.net，但是不建议将服务端部署在中国大陆主机上
-  ${Green_font_prefix} 1.${Font_color_suffix} GitHub
-  ${Green_font_prefix} 2.${Font_color_suffix} Coding.net (部分资源通过 FastGit 提供服务下载, Thanks to FastGit.org for the service)"
+  echo -e "${Info} 请输入要选择的下载源，默认使用 GitHub 官方源；中国大陆建议选择 GitHub 加速镜像
+  ${Green_font_prefix} 1.${Font_color_suffix} GitHub 官方源
+  ${Green_font_prefix} 2.${Font_color_suffix} GitHub 加速镜像（不可用时自动回退官方源）
+  ${Tip} 原“Coding.net 镜像”依赖的 FastGit 已于 2022 年停止服务，现已改为通用加速镜像"
   read -erp "请输入数字 [1-2], 默认为 1:" mirror_num
   [[ -z "${mirror_num}" ]] && mirror_num=1
-  [[ ${mirror_num} == 2 ]] && link_prefix=${coding_prefix} || link_prefix=${github_prefix}
+  _download_source_resolved=""
+  Set_download_source
 }
 check_sys
 action=$1
