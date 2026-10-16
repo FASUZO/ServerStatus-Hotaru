@@ -1,9 +1,0 @@
-# ServerStatus (sergate) 预编译产物 —— 静态链接 + strip
-# 源码版本: FASUZO/ServerStatus-Hotaru @ commit 49d0ac5 (与 server/ 源码一致)
-# 工具链  : gcc/g++ 12.2.0 (Debian 12), 编译参数 -Wall -O2 -static
-# 命名约定: amd64=x86_64 | arm64=aarch64 | armv7=32位ARM(armhf)
-# 用途    : status.sh 在本机 make 失败(缺少 gcc/make)时自动回退使用
-# 校验方式: sha256sum -c SHA256SUMS
-d9148c4c5bff26a9fa542877fa435dd5c8901d6ccb321f86e5b4187dca90a824  sergate-linux-amd64-static
-9ea09228694ae40ec89d47afe0ab78bf7bf7e3a75afb83063d0e83851beb0c8a  sergate-linux-arm64-static
-631705988a754af7bc10ab3863e50c8bc8a658180444372fe15d22132fe5619d  sergate-linux-armv7-static

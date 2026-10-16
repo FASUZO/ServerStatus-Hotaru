@@ -52,6 +52,7 @@ link_prefix="${github_raw}"                  # 实际生效的仓库文件前缀
 github_link="https://github.com"             # releases / 归档下载前缀
 raw_link="https://raw.githubusercontent.com" # raw 文件下载前缀
 _download_source_resolved=""
+prebuilt_release_tag="prebuilt"              # 预编译产物所在 GitHub Release 的固定 tag
 prebuilt_file=""                             # 预编译产物路径，由 Get_prebuilt_binary 赋值
 
 Green_font_prefix="\033[32m" && Red_font_prefix="\033[31m" && Red_background_prefix="\033[41;37m" && Font_color_suffix="\033[0m"
@@ -131,10 +132,10 @@ Set_download_source() {
     fi
   fi
 }
-# 选取与本机架构匹配的预编译产物（仓库内 prebuilt/ 目录，随归档一起下载）。
-# 成功时设置全局变量 prebuilt_file 并返回 0；找不到对应架构或校验失败则返回 1。
+# 下载与本机架构匹配的预编译产物（来自 GitHub Release，按需下载，不进归档）。
+# 成功时设置全局变量 prebuilt_file 并返回 0；架构不支持 / 下载失败 / 校验失败 均返回 1。
 Get_prebuilt_binary() {
-  local arch pb sums want got
+  local arch pb base sums want got
   arch=$(uname -m)
   case "${arch}" in
   x86_64 | amd64) pb="sergate-linux-amd64-static" ;;
@@ -146,24 +147,39 @@ Get_prebuilt_binary() {
     ;;
   esac
 
-  prebuilt_file="/tmp/${repo_name}-${repo_branch}/prebuilt/${pb}"
-  if [[ ! -e "${prebuilt_file}" ]]; then
-    echo -e "${Error} 预编译文件不存在: ${prebuilt_file}"
+  base="${github_link}/${repo_owner}/${repo_name}/releases/download/${prebuilt_release_tag}"
+  prebuilt_file="/tmp/${pb}"
+  sums="/tmp/${pb}.SHA256SUMS"
+  rm -f "${prebuilt_file}" "${sums}"
+
+  echo -e "${Info} 正在从 GitHub Release 下载预编译版本：${pb}"
+  wget -N --no-check-certificate "${base}/${pb}" -O "${prebuilt_file}" >/dev/null 2>&1
+  if [[ ! -s "${prebuilt_file}" ]]; then
+    echo -e "${Error} 预编译版本下载失败：${base}/${pb}"
+    rm -f "${prebuilt_file}"
     return 1
   fi
 
-  # 若随包提供了校验清单，则校验，避免使用损坏或不可信的二进制
-  sums="/tmp/${repo_name}-${repo_branch}/prebuilt/SHA256SUMS"
-  if [[ -e "${sums}" ]] && command -v sha256sum >/dev/null 2>&1; then
-    want=$(grep -E "[[:space:]]${pb}\$" "${sums}" | awk '{print $1}' | head -1)
-    got=$(sha256sum "${prebuilt_file}" | awk '{print $1}')
-    if [[ -n "${want}" && "${want}" != "${got}" ]]; then
-      echo -e "${Error} 预编译文件校验失败（期望 ${want}，实际 ${got}）"
-      return 1
+  # 校验和取自同一个 release，保证与被下载的二进制同源
+  if command -v sha256sum >/dev/null 2>&1; then
+    wget -q --no-check-certificate "${base}/SHA256SUMS" -O "${sums}" >/dev/null 2>&1
+    if [[ -s "${sums}" ]]; then
+      want=$(grep -E "[[:space:]]${pb}\$" "${sums}" | awk '{print $1}' | head -1)
+      got=$(sha256sum "${prebuilt_file}" | awk '{print $1}')
+      if [[ -z "${want}" ]]; then
+        echo -e "${Tip} 校验清单中未包含 ${pb}，跳过校验"
+      elif [[ "${want}" != "${got}" ]]; then
+        echo -e "${Error} 预编译文件校验失败（期望 ${want}，实际 ${got}）"
+        rm -f "${prebuilt_file}"
+        return 1
+      else
+        echo -e "${Info} 预编译版本校验通过：${pb}"
+      fi
+    else
+      echo -e "${Tip} 未能获取校验清单，跳过校验"
     fi
-    [[ -n "${want}" ]] && echo -e "${Info} 预编译版本校验通过：${pb}"
   fi
-  echo -e "${Info} 使用预编译版本：${pb}（对应 server/ 源码 commit 见 prebuilt/SHA256SUMS）"
+  echo -e "${Info} 使用预编译版本：${pb}（构建溯源见该 Release 的 SHA256SUMS）"
   return 0
 }
 Download_Server_Status_server() {
@@ -180,9 +196,9 @@ Download_Server_Status_server() {
   cd "/tmp/${repo_name}-${repo_branch}/server" || exit 1
   make
   if [[ ! -e "sergate" ]]; then
-    # 本机编译失败（缺少 gcc/make、依赖不全等）时回退到仓库内的预编译产物，
+    # 本机编译失败（缺少 gcc/make、依赖不全等）时回退到 GitHub Release 上的预编译产物，
     # 保证「无法编译」的机器仍然能装起来用。
-    echo -e "${Tip} 本机编译失败（可能缺少 gcc/make），改试仓库内的预编译版本 ..."
+    echo -e "${Tip} 本机编译失败（可能缺少 gcc/make），改试预编译版本 ..."
     if Get_prebuilt_binary; then
       cp -f "${prebuilt_file}" "sergate"
       chmod +x "sergate"
